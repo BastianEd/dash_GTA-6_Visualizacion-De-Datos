@@ -706,4 +706,4 @@ if __name__ == "__main__":
     df_datos = cargar_datos()
     print(f"Cargados {len(df_datos)} comentarios, {df_datos['video'].nunique()} videos, {df_datos['tema_principal'].nunique()} temas.")
     app = crear_app(df_datos)
-    app.run(debug=True, port=8088)
+    app.run_server(debug=False)
