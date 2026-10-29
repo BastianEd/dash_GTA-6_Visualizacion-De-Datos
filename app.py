@@ -5,9 +5,11 @@ Asignatura: ADY1104 Visualización de Datos
 Pregunta central: ¿Qué tema debería priorizar Rockstar al comunicar GTA VI?
 
 Uso:
-1. Instala dependencias: pip install dash pandas openpyxl plotly
+1. Instala dependencias: pip install -r requirements.txt
 2. Asegúrate de tener el archivo "GTA_VI_Datos_Visualizacion.xlsx" en la carpeta data/
-3. Ejecuta el script: python dashboard_gta_vi.py
+3. Ejecuta localmente: python app.py
+4. En Windows, inicia el servidor WSGI con: waitress-serve --listen=127.0.0.1:8088 app:server
+5. En Render, usa el Blueprint definido en render.yaml
 """
 
 from __future__ import annotations
@@ -702,8 +704,10 @@ def crear_app(df: pd.DataFrame) -> Dash:
 # ---------------------------------------------------------------------------
 # 7. Punto de Entrada Principal
 # ---------------------------------------------------------------------------
+df_datos = cargar_datos()
+print(f"Cargados {len(df_datos)} comentarios, {df_datos['video'].nunique()} videos, {df_datos['tema_principal'].nunique()} temas.")
+app = crear_app(df_datos)
+server = app.server
+
 if __name__ == "__main__":
-    df_datos = cargar_datos()
-    print(f"Cargados {len(df_datos)} comentarios, {df_datos['video'].nunique()} videos, {df_datos['tema_principal'].nunique()} temas.")
-    app = crear_app(df_datos)
-    app.run_server(debug=False)
+    app.run(debug=False, port=8088)
