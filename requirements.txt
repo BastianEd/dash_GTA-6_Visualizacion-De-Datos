@@ -1,6 +1,6 @@
 dash
 pandas
-openpyxl 
+openpyxl
 plotly
 gunicorn
 waitress

@@ -15,6 +15,7 @@ Uso:
 from __future__ import annotations
 
 import math
+import unicodedata
 from datetime import date
 from pathlib import Path
 from urllib.parse import quote
@@ -27,7 +28,10 @@ from dash import Dash, Input, Output, dash_table, dcc, html
 # 1. Configuración y Constantes
 # ---------------------------------------------------------------------------
 NOMBRE_ARCHIVO = "GTA_VI_Datos_Visualizacion.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
 CANDIDATAS = [
+    BASE_DIR / "data" / NOMBRE_ARCHIVO,
+    BASE_DIR / NOMBRE_ARCHIVO,
     Path.cwd() / "data" / NOMBRE_ARCHIVO,
     Path.cwd() / NOMBRE_ARCHIVO,
     Path.cwd().parent / "data" / NOMBRE_ARCHIVO,
@@ -88,6 +92,51 @@ def filtrar(df: pd.DataFrame, **seleccion: list[str] | None) -> pd.DataFrame:
         if valores:
             mask &= df[columna].isin(valores)
     return df[mask]
+
+
+def _sin_tildes(texto) -> str:
+    """Minúsculas y sin tildes, para que 'grafico' encuentre 'gráfico'."""
+    return "".join(c for c in unicodedata.normalize("NFD", str(texto)) if unicodedata.category(c) != "Mn").lower()
+
+
+def buscar(df: pd.DataFrame, texto: str | None) -> pd.DataFrame:
+    """Comentarios que contienen TODAS las palabras escritas (sin importar mayúsculas ni tildes)."""
+    palabras = _sin_tildes(texto or "").split()
+    if not palabras:
+        return df
+    base = df["comentario"].map(_sin_tildes)
+    mask = pd.Series(True, index=df.index)
+    for palabra in palabras:
+        mask &= base.str.contains(palabra, regex=False)
+    return df[mask]
+
+
+def filtrar_v3(df: pd.DataFrame, texto: str | None, preguntas: str | None) -> pd.DataFrame:
+    """Filtros propios de la vista 3: búsqueda de palabras y tipo de comentario (pregunta o no)."""
+    df = buscar(df, texto)
+    if preguntas == "si":
+        df = df[df["es_pregunta"].eq("Sí")]
+    elif preguntas == "no":
+        df = df[df["es_pregunta"].eq("No")]
+    return df
+
+
+def resumen_filtros(videos, sentimientos, temas, texto, preguntas) -> str:
+    """Texto con los filtros activos, p. ej. 'Video 1 · Negativo · palabra “fps”'. Vacío si no hay ninguno."""
+    partes = []
+    if videos:
+        partes.append(", ".join(videos))
+    if sentimientos:
+        partes.append(", ".join(sentimientos))
+    if temas:
+        partes.append(", ".join(temas))
+    if texto and texto.strip():
+        partes.append(f"contiene “{texto.strip()}”")
+    if preguntas == "si":
+        partes.append("solo preguntas")
+    elif preguntas == "no":
+        partes.append("sin preguntas")
+    return " · ".join(partes)
 
 
 def composicion(df: pd.DataFrame, columna: str) -> pd.DataFrame:
@@ -162,7 +211,7 @@ def _estilo(fig: go.Figure, alto: int) -> go.Figure:
     """Estilo común (modo noche): fuente clara, fondo transparente y leyenda inferior."""
     fig.update_layout(
         height=alto, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(family=F_TEXTO, size=13, color=TINTA),
+        font=dict(family=F_TEXTO, size=14, color=TINTA),
         margin=dict(l=10, r=30, t=10, b=40),
         legend=dict(orientation="h", y=-0.18, x=0, font=dict(color=TINTA)),
         hoverlabel=dict(bgcolor=PANEL, bordercolor=ACENTO, font=dict(family=F_TEXTO, color=TINTA)),
@@ -230,92 +279,19 @@ def fig_composicion(c: pd.DataFrame) -> go.Figure:
     return _estilo(fig, 90 + 56 * len(c))
 
 
-def fig_simple(valores: pd.Series, n: pd.Series, texto: list[str]) -> go.Figure:
-    """Barras horizontales de un solo color."""
+def fig_barras_h(etiquetas: list[str], valores, textos: list[str], resaltar: int | None = None) -> go.Figure:
+    """Barras horizontales simples: una sola serie, la barra más importante resaltada en rosa."""
+    valores = [float(v) for v in valores]
+    colores = [NEON["rosa"] if i == resaltar else NEON["cian"] for i in range(len(valores))]
     fig = go.Figure(go.Bar(
-        y=_etiquetas(n), x=valores, orientation="h", marker_color=NEON["cian"],
-        text=texto, textposition="outside", cliponaxis=False,
+        y=etiquetas, x=valores, orientation="h", marker_color=colores, text=textos,
+        textposition="outside", cliponaxis=False, textfont=dict(size=14, color=TINTA),
+        hovertemplate="%{y}: %{text}<extra></extra>",
     ))
-    fig.update_xaxes(range=[0, valores.max() * 1.25 if len(valores) else 1])
-    return _estilo(fig, 60 + 36 * len(valores))
-
-
-def fig_mapa_tension(c: pd.DataFrame) -> go.Figure:
-    """Mapa de Leonida: cuánto se habla de cada tema (x) frente a cuánto divide (y)."""
-    total = c["n"].sum()
-    d = c.assign(peso=(c["n"] / total * 100).round(1)).sort_values("peso")
-    d = d.assign(pos=(["top center", "bottom center"] * len(d))[:len(d)])
-    prom_peso = 100 / len(d)
-    prom_pol = float((d["polarizacion"] * d["n"]).sum() / total)
-    lim = max(10.0, float(d["balance"].abs().max()))
-    tam_ref = 2 * float(d["n"].max()) / (58 ** 2)
-
-    fig = go.Figure()
-    grupos = (
-        (f"Base suficiente (n ≥ {MIN_N})", d[d["n"] >= MIN_N], False),
-        (f"Base pequeña (n < {MIN_N}) ⚠", d[d["n"] < MIN_N], True),
-    )
-    for nombre, g, hueco in grupos:
-        if g.empty:
-            continue
-        colores = [_color_balance(b, lim) for b in g["balance"]]
-        fig.add_trace(go.Scatter(
-            x=g["peso"], y=g["polarizacion"], mode="markers+text", name=nombre,
-            text=[f"{t}{' ⚠' if hueco else ''}" for t in g.index], textposition=list(g["pos"]),
-            textfont=dict(color=TINTA, size=12),
-            marker=dict(size=list(g["n"]), sizemode="area", sizeref=tam_ref, sizemin=9,
-                        color="rgba(0,0,0,0)" if hueco else colores, opacity=1 if hueco else 0.92,
-                        line=dict(color=colores, width=3 if hueco else 1.5)),
-            customdata=g[["n", "Positivo", "Negativo", "balance"]],
-            hovertemplate=("<b>%{text}</b><br>Peso: %{x:.1f}% de los comentarios"
-                           "<br>División: %{y:.1f}% (positivo + negativo)"
-                           "<br>Positivo %{customdata[1]:.1f}% · Negativo %{customdata[2]:.1f}%"
-                           "<br>Balance %{customdata[3]:+.1f} pp · n=%{customdata[0]}<extra></extra>"),
-        ))
-    fig.add_hline(y=prom_pol, line_dash="dash", line_color=NEON["cian"], opacity=0.55)
-    fig.add_vline(x=prom_peso, line_dash="dash", line_color=NEON["cian"], opacity=0.55)
-    for x, y, xa, ya, t in ((0.01, 0.99, "left", "top", "Nicho que divide"), (0.99, 0.99, "right", "top", "Foco masivo"),
-                            (0.99, 0.01, "right", "bottom", "Conversación tranquila"), (0.01, 0.01, "left", "bottom", "Poco ruido")):
-        fig.add_annotation(xref="paper", yref="paper", x=x, y=y, xanchor=xa, yanchor=ya, text=t.upper(),
-                           showarrow=False, font=dict(family=F_DISPLAY, size=13, color="rgba(185,188,224,.6)"))
-    fig.update_xaxes(title="Peso del tema (% de los comentarios)", ticksuffix="%",
-                     range=[0, float(d["peso"].max()) * 1.18 + 2])
-    fig.update_yaxes(title="División (% positivo + % negativo)", ticksuffix="%",
-                     range=[0, max(float(d["polarizacion"].max()) * 1.25, prom_pol * 1.5, 10)])
-    _estilo(fig, 470)
-    fig.update_layout(margin=dict(l=10, r=30, t=10, b=90), legend=dict(orientation="h", y=-0.27, x=0))
-    return fig
-
-
-def fig_calor(df: pd.DataFrame) -> go.Figure:
-    """Mapa de calor tema x video con el % de comentarios negativos."""
-    n = pd.crosstab(df["tema_principal"], df["video"])
-    neg = (df[df["sentimiento"].eq("Negativo")].groupby(["tema_principal", "video"]).size()
-           .unstack(fill_value=0).reindex(index=n.index, columns=n.columns, fill_value=0))
-    orden = (neg.sum(axis=1) / n.sum(axis=1)).sort_values(ascending=False).index
-    n, neg = n.loc[orden], neg.loc[orden]
-    p = neg / n * 100
-    filas = [f"{t} (n={int(n.loc[t].sum())})" for t in orden]
-    z = p.where(n >= MIN_CELDA)
-    zmax = max(25.0, float(z.max().max())) if z.notna().any().any() else 25.0
-
-    fig = go.Figure(go.Heatmap(
-        z=z.values, x=list(n.columns), y=filas, zmin=0, zmax=zmax, xgap=4, ygap=4, hoverongaps=False,
-        colorscale=[[0, "#1B1850"], [1, NEON["rosa"]]],
-        colorbar=dict(title=dict(text="% negativo"), ticksuffix="%", thickness=12, len=0.85),
-        hovertemplate="%{y}<br>%{x}: %{z:.1f}% negativo<extra></extra>",
-    ))
-    for i, tema in enumerate(orden):
-        for video in n.columns:
-            k = int(n.loc[tema, video])
-            if k >= MIN_CELDA:
-                texto, color = f"{p.loc[tema, video]:.0f}%<br><span style='font-size:10px'>n={k}</span>", TINTA
-            else:
-                texto, color = f"n={k}", "#6D70A0"
-            fig.add_annotation(x=video, y=filas[i], text=texto, showarrow=False, font=dict(size=12, color=color))
-    fig.update_yaxes(autorange="reversed", showgrid=False)
-    fig.update_xaxes(side="top", showgrid=False)
-    return _estilo(fig, 120 + 48 * len(orden))
+    tope = max(valores) * 1.3 if valores else 1.0
+    fig.update_xaxes(range=[0, tope if tope > 0 else 1.0], showticklabels=False, showgrid=False)
+    fig.update_yaxes(tickfont=dict(size=14))
+    return _estilo(fig, 70 + 40 * len(valores))
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +299,10 @@ def fig_calor(df: pd.DataFrame) -> go.Figure:
 # ---------------------------------------------------------------------------
 S_TARJETA = dict(
     background="linear-gradient(160deg, rgba(36,31,98,.92), rgba(15,13,46,.94))",
-    border=f"1px solid {BORDE}", borderRadius="14px", padding="18px 20px",
+    border=f"1px solid {BORDE}", borderRadius="14px", padding="18px 20px", minWidth="0",
 )
 S_TITULO = dict(fontFamily=F_TITULO, fontSize="18px", fontWeight=700, margin="0 0 6px", color=TINTA, lineHeight="1.25")
-S_NOTA = dict(fontSize="14px", color=SUAVE, margin="0 0 8px", lineHeight="1.45")
+S_NOTA = dict(fontSize="15px", color=SUAVE, margin="0 0 8px", lineHeight="1.45")
 
 
 def tarjeta(titulo: str, *hijos, nota: str | None = None, acento: str = ACENTO, etiqueta: str | None = None) -> html.Section:
@@ -395,8 +371,7 @@ def grafico(fig: go.Figure) -> dcc.Graph:
 
 
 FILA = dict(display="flex", flexWrap="wrap", gap="16px", marginBottom="16px")
-GRILLA = dict(display="grid", gridTemplateColumns="repeat(auto-fit, minmax(420px, 1fr))", gap="16px")
-ANCHO_TOTAL = dict(gridColumn="1 / -1")
+COLUMNA = dict(display="flex", flexDirection="column", gap="16px")
 
 
 # ---------------------------------------------------------------------------
@@ -446,120 +421,223 @@ def vista_resumen(df: pd.DataFrame) -> html.Div:
     ])
 
 
+def bloque(num: int, pregunta: str, hallazgo: str, *contenido, como: str | None = None, acento: str = ACENTO) -> html.Section:
+    """Tarjeta con estructura fija: pregunta -> conclusión en una frase -> gráfico -> cómo leerlo."""
+    hijos = [html.P(["→ ", hallazgo], style=dict(fontSize="16px", fontWeight=600, color=TINTA, margin="0 0 10px", lineHeight="1.4")),
+             *contenido]
+    if como:
+        hijos.append(html.P([html.Strong("Cómo leerlo: "), como], style={**S_NOTA, "margin": "8px 0 0"}))
+    return tarjeta(pregunta, *hijos, acento=acento, etiqueta=f"PREGUNTA {num}")
+
+
+def leyenda() -> html.Div:
+    """Guía rápida de colores y símbolos que se usan en toda la vista."""
+    def punto(color: str) -> html.Span:
+        return html.Span(style=dict(display="inline-block", width="12px", height="12px", borderRadius="50%",
+                                    background=color, marginRight="6px", verticalAlign="middle"))
+    chips = [html.Span([punto(COLORES[k]), k], className="chip", style=dict(color=TINTA)) for k in ORDEN]
+    chips.append(html.Span(f"⚠ = menos de {MIN_N} comentarios: tómalo con cuidado", className="chip", style=dict(color=NEON["naranja"])))
+    return html.Div([html.Span("GUÍA RÁPIDA", style=dict(fontFamily=F_DISPLAY, letterSpacing="2px", fontSize="13px",
+                                                          color=ACENTO, marginRight="12px")), *chips],
+                    style=dict(display="flex", flexWrap="wrap", alignItems="center"))
+
+
+def tabla_tema_video(df: pd.DataFrame) -> html.Div:
+    """Tabla tema x video con el % de comentarios negativos; más rosa = más críticas."""
+    n = pd.crosstab(df["tema_principal"], df["video"])
+    neg = (df[df["sentimiento"].eq("Negativo")].groupby(["tema_principal", "video"]).size()
+           .unstack(fill_value=0).reindex(index=n.index, columns=n.columns, fill_value=0))
+    p = neg / n * 100
+    n_tot, p_tot = n.sum(axis=1), neg.sum(axis=1) / n.sum(axis=1) * 100
+    orden = p_tot.sort_values(ascending=False).index
+    visibles = p.where(n >= MIN_CELDA)
+    zmax = max(25.0, float(visibles.max().max())) if visibles.notna().any().any() else 25.0
+
+    def celda(k: int, pc: float) -> html.Td:
+        base = dict(textAlign="center", padding="8px 10px", border=f"1px solid {BORDE}", minWidth="110px")
+        if k >= MIN_CELDA:
+            fondo = _mezcla("#1B1850", NEON["rosa"], min(1.0, pc / zmax))
+            return html.Td([html.Div(f"{pc:.0f}%", style=dict(fontFamily=F_DISPLAY, fontSize="22px", letterSpacing="1px")),
+                            html.Div(f"de {k} comentarios", style=dict(fontSize="12px"))],
+                           style={**base, "background": fondo, "color": "white"})
+        texto = "sin comentarios" if k == 0 else f"muy pocos (solo {k})"
+        return html.Td(texto, style={**base, "background": PANEL, "color": "#8C90BD", "fontSize": "13px"})
+
+    th = dict(padding="8px 10px", fontFamily=F_TITULO, fontSize="14px", color=NEON["cian"], textAlign="center",
+              borderBottom=f"2px solid {BORDE}")
+    cabecera = html.Tr([html.Th("Tema", style={**th, "textAlign": "left"}),
+                        *[html.Th(v, style=th) for v in n.columns], html.Th("Todos los videos", style=th)])
+    filas = [html.Tr([
+        html.Td(f"{t}{' ⚠' if n_tot[t] < MIN_N else ''}", style=dict(padding="8px 10px", fontWeight=600, fontSize="15px")),
+        *[celda(int(n.loc[t, v]), float(p.loc[t, v])) for v in n.columns],
+        celda(int(n_tot[t]), float(p_tot[t])),
+    ]) for t in orden]
+    return html.Div(html.Table([html.Thead(cabecera), html.Tbody(filas)],
+                               style=dict(width="100%", borderCollapse="separate", borderSpacing="4px")),
+                    style=dict(overflowX="auto"))
+
+
 def vista_temas(df: pd.DataFrame) -> html.Div:
-    """Vista 2: mapa de tensión, sentimiento por video, mapa de calor, ranking y preguntas."""
+    """Vista 2: cinco preguntas simples sobre temas y videos, cada una con su conclusión."""
+    n_tot = len(df)
     cv, ct = composicion(df, "video"), contraste_por_tema(df)
-    neg = cv["Negativo"]
-    t_video = (f"Entre videos, el sentimiento negativo va de {pct(neg.min())} a {pct(neg.max())}"
-               if len(cv) > 1 else "Sentimiento del video seleccionado")
-
     base = ct[ct["n"] >= MIN_N]
-    if base.empty:
-        t_mapa = "Peso y división de cada tema"
-    else:
-        foco = base["polarizacion"].idxmax()
-        fb = base.loc[foco]
-        t_mapa = (f"{foco}: {pct(fb['n'] / ct['n'].sum() * 100)} de los comentarios "
-                  f"y la mayor división ({pct(fb['polarizacion'])} positivo o negativo)")
 
-    celda = celda_mas_critica(df)
-    if celda is None:
-        t_calor = "Crítica por tema y video (ninguna celda tiene base suficiente)"
-    elif celda[2] == 0:
-        t_calor = "Ninguna celda con base suficiente tiene comentarios negativos"
-    else:
-        t_calor = f"La celda más crítica es {celda[0]} en {celda[1]}: {pct(celda[2])} de {celda[3]} comentarios"
-
+    # 1. ¿De qué habla la gente?
     conteo = df["tema_principal"].value_counts().sort_values()
     top = conteo.idxmax()
-    nota_rank = ("“Otros temas” agrupa lo que las reglas de palabras clave no lograron clasificar."
-                 if top == "Otros temas" else None)
+    h1 = f"{top} es lo más comentado: {int(conteo.max())} de {n_tot} comentarios ({pct(conteo.max() / n_tot * 100)})."
+    concretos = conteo.drop("Otros temas", errors="ignore")
+    if top == "Otros temas" and not concretos.empty:
+        h1 += f" Entre los temas concretos, el más comentado es {concretos.idxmax()} ({int(concretos.max())})."
+    c1 = "Cada barra es un tema; más larga significa más comentarios. “Otros temas” junta lo que no encajó en ninguna categoría."
+    b1 = bloque(1, "¿De qué habla la gente?", h1, grafico(fig_barras_h(
+        list(conteo.index), conteo.values, [f"{v}  ({v / n_tot * 100:.1f}%)" for v in conteo.values],
+        resaltar=len(conteo) - 1)), como=c1, acento=NEON["cian"])
 
+    # 2. ¿Qué temas generan más críticas y más elogios?
+    if base.empty:
+        h2 = f"Ningún tema llega a {MIN_N} comentarios, así que no se puede comparar con confianza."
+    elif base["Negativo"].max() == 0:
+        h2 = "Ningún tema con base suficiente tiene comentarios negativos."
+    else:
+        crit, elog = base["Negativo"].idxmax(), base["Positivo"].idxmax()
+        if crit == elog:
+            h2 = (f"{crit} es el tema que más divide: {pct(base.loc[crit, 'Negativo'])} de sus comentarios son negativos "
+                  f"y {pct(base.loc[crit, 'Positivo'])} positivos.")
+        else:
+            h2 = (f"{crit} es el tema con más críticas ({pct(base.loc[crit, 'Negativo'])} negativos) y "
+                  f"{elog} el que recibe más elogios ({pct(base.loc[elog, 'Positivo'])} positivos).")
+    c2 = ("Cada fila es un tema. La barra rosa hacia la izquierda son los comentarios negativos y la verde hacia la derecha los "
+          "positivos. Lo que falta para llegar a 100 % es neutral y no se dibuja.")
+    b2 = bloque(2, "¿Qué temas generan más críticas y más elogios?", h2,
+                grafico(fig_divergente(ct.sort_values("Negativo"))), como=c2, acento=NEON["rosa"])
+
+    # 3. ¿Cambia según el video?
+    neg = cv["Negativo"]
+    h3 = (f"El sentimiento negativo va de {pct(neg.min())} a {pct(neg.max())} según el video."
+          if len(cv) > 1 else "Estás viendo un solo video.")
+    c3 = "Cada barra es un video y suma 100 %. Verde = positivo, gris = neutral, rosa = negativo. n = comentarios de ese video."
+    b3 = bloque(3, "¿Cambia la opinión según el video?", h3, grafico(fig_composicion(cv)), como=c3, acento=NEON["violeta"])
+
+    # 4. ¿Dónde se concentran las críticas?
+    celda = celda_mas_critica(df)
+    if celda is None:
+        h4 = f"Ninguna combinación de tema y video llega a {MIN_CELDA} comentarios."
+    elif celda[2] == 0:
+        h4 = "Ninguna combinación con base suficiente tiene comentarios negativos."
+    else:
+        h4 = f"La combinación más crítica es {celda[0]} en {celda[1]}: {pct(celda[2])} de {celda[3]} comentarios son negativos."
+    c4 = (f"Cada casilla muestra el % de comentarios negativos de ese tema en ese video: más rosa = más críticas. "
+          f"Si hay menos de {MIN_CELDA} comentarios no se calcula el porcentaje, porque un solo comentario cambiaría demasiado el resultado.")
+    b4 = bloque(4, "¿En qué tema y video se concentran las críticas?", h4, tabla_tema_video(df), como=c4, acento=NEON["naranja"])
+
+    # 5. ¿Qué dudas hace la gente?
     pt = preguntas_por_tema(df)
     elegibles = pt[pt["n"] >= MIN_N]
-    t_preg = (f"{elegibles['pct'].idxmax()} tiene la mayor proporción de preguntas "
-              f"({pct(elegibles['pct'].max())})" if not elegibles.empty else "Preguntas por tema")
+    h5 = (f"{elegibles['pct'].idxmax()} es el tema con más preguntas ({pct(elegibles['pct'].max())} de sus comentarios)."
+          if not elegibles.empty else "Ningún tema tiene base suficiente para comparar preguntas.")
     plat = "Plataformas y rendimiento"
-    nota_preg = (f"En {plat.lower()} solo {pct(pt.loc[plat, 'pct'])} son preguntas: la inquietud "
-                 "aparece más como opinión que como duda explícita." if plat in pt.index else None)
+    nota_plat = ""
+    if plat in pt.index:
+        p_plat, n_plat = float(pt.loc[plat, "pct"]), int(pt.loc[plat, "n"])
+        p_gen = float(df["es_pregunta"].eq("Sí").mean() * 100)
+        if p_plat < p_gen:
+            nota_plat = (f" En {plat.lower()} son preguntas el {pct(p_plat)} (promedio {pct(p_gen)}): "
+                         "la inquietud aparece más como opinión que como duda explícita.")
+        elif p_plat > p_gen:
+            nota_plat = f" En {plat.lower()} son preguntas el {pct(p_plat)} (promedio {pct(p_gen)}): hay más dudas explícitas que en el resto."
+        if n_plat < MIN_N and nota_plat:
+            nota_plat += f" ⚠ Base pequeña (n={n_plat})."
+    c5 = "Muestra qué % de los comentarios de cada tema contiene una pregunta. Entre paréntesis, cuántos comentarios tiene el tema." + nota_plat
+    b5 = bloque(5, "¿Sobre qué temas hace preguntas la gente?", h5, grafico(fig_barras_h(
+        [f"{t} (n={int(v)}){' ⚠' if v < MIN_N else ''}" for t, v in pt["n"].items()],
+        pt["pct"].values, [pct(v) for v in pt["pct"]],
+        resaltar=(list(pt.index).index(elegibles["pct"].idxmax()) if not elegibles.empty else None))),
+        como=c5, acento=NEON["amarillo"])
 
-    return html.Div([
-        html.Div(tarjeta(
-            t_mapa, grafico(fig_mapa_tension(ct)), acento=NEON["cian"], etiqueta="MAPA DE LEONIDA",
-            nota=("Cada burbuja es un tema: a la derecha se habla más de él y arriba divide más (positivo + negativo). "
-                  "Tamaño = n. Color: verde = más positivos que negativos, rosa = al revés. "
-                  f"Círculo hueco ⚠ = menos de {MIN_N} comentarios. Líneas punteadas = promedios."),
-        ), style=ANCHO_TOTAL),
-        tarjeta(t_video, grafico(fig_composicion(cv)), acento=NEON["rosa"], etiqueta="POR VIDEO",
-                nota="Porcentajes por video; la base (n) cambia entre videos."),
-        tarjeta(t_calor, grafico(fig_calor(df)), acento=NEON["naranja"], etiqueta="MAPA DE CALOR",
-                nota=f"% de comentarios negativos por tema y video. Las celdas con menos de {MIN_CELDA} comentarios no se pintan."),
-        tarjeta(f"{top} es el grupo más grande ({pct(conteo.max() / conteo.sum() * 100)})",
-                grafico(fig_simple(conteo, conteo, [f"{v}" for v in conteo])), nota=nota_rank,
-                acento=NEON["violeta"], etiqueta="RANKING"),
-        tarjeta(t_preg, grafico(fig_simple(pt["pct"], pt["n"], [pct(v) for v in pt["pct"]])), nota=nota_preg,
-                acento=NEON["amarillo"], etiqueta="PREGUNTAS"),
-    ], style=GRILLA)
+    return html.Div([leyenda(), b1, b2, b3, b4, b5], style=COLUMNA)
 
 
-def vista_evidencia(df: pd.DataFrame, df_global: pd.DataFrame) -> html.Div:
-    """Vista 3: comentarios seleccionados, estado de revisión y limitaciones."""
+def vista_evidencia(df: pd.DataFrame, df_global: pd.DataFrame, filtros_activos: str = "") -> html.Div:
+    """Vista 3: los comentarios reales y qué tan confiables son las etiquetas."""
+    prioridad = {"Negativo": 0, "Positivo": 1, "Neutral": 2}
+    dt = df.assign(_o=df["sentimiento"].map(prioridad)).sort_values("_o", kind="stable")
     cols = ["video", "tema_principal", "sentimiento", "es_pregunta", "comentario"]
+    nombres = {"video": "Video", "tema_principal": "Tema", "sentimiento": "Sentimiento",
+               "es_pregunta": "¿Pregunta?", "comentario": "Comentario"}
     tabla = dash_table.DataTable(
-        data=df[cols].to_dict("records"),
-        columns=[{"name": c.replace("_", " ").capitalize(), "id": c} for c in cols],
-        page_size=10, sort_action="native", filter_action="native",
+        data=dt[cols].to_dict("records"),
+        columns=[{"name": nombres[c], "id": c} for c in cols],
+        page_size=10, sort_action="native",
         style_table=dict(overflowX="auto"),
         style_header=dict(fontWeight=700, backgroundColor="#221E5E", color=TINTA, fontFamily=F_TITULO,
-                          border=f"1px solid {BORDE}"),
-        style_filter=dict(backgroundColor="#0F0D33", color=TINTA, border=f"1px solid {BORDE}"),
-        style_cell=dict(textAlign="left", whiteSpace="normal", height="auto", padding="8px",
-                        fontFamily=F_TEXTO, fontSize="14px", backgroundColor=PANEL, color=TINTA,
+                          border=f"1px solid {BORDE}", fontSize="15px"),
+        style_cell=dict(textAlign="left", whiteSpace="normal", height="auto", padding="10px",
+                        fontFamily=F_TEXTO, fontSize="15px", lineHeight="1.4", backgroundColor=PANEL, color=TINTA,
                         border=f"1px solid {BORDE}"),
-        style_cell_conditional=[{"if": {"column_id": "comentario"}, "minWidth": "340px", "width": "45%"}],
+        style_cell_conditional=[
+            {"if": {"column_id": "video"}, "width": "80px", "minWidth": "80px"},
+            {"if": {"column_id": "tema_principal"}, "width": "170px", "minWidth": "150px"},
+            {"if": {"column_id": "sentimiento"}, "width": "110px", "minWidth": "100px"},
+            {"if": {"column_id": "es_pregunta"}, "width": "90px", "minWidth": "80px"},
+            {"if": {"column_id": "comentario"}, "minWidth": "320px"},
+        ],
         style_data_conditional=[
+            {"if": {"row_index": "odd"}, "backgroundColor": "#1B1850"},
             {"if": {"filter_query": '{sentimiento} = "Positivo"', "column_id": "sentimiento"},
              "color": COLORES["Positivo"], "fontWeight": 700},
             {"if": {"filter_query": '{sentimiento} = "Negativo"', "column_id": "sentimiento"},
              "color": COLORES["Negativo"], "fontWeight": 700},
-            {"if": {"state": "active"}, "backgroundColor": "#2A2570", "border": f"1px solid {ACENTO}"},
+            {"if": {"filter_query": '{es_pregunta} = "Sí"', "column_id": "es_pregunta"},
+             "color": NEON["amarillo"], "fontWeight": 700},
         ],
     )
-    sin_validar = df["estado_revision"].str.contains("sin validación").mean() * 100 if "estado_revision" in df.columns else 100.0
-    n_mixtos = int(df["posible_mixto"].eq("Sí").sum()) if "posible_mixto" in df.columns else 0
+    vc = df["sentimiento"].value_counts()
     n_preg = int(df["es_pregunta"].eq("Sí").sum())
+    sin_validar = df["estado_revision"].str.contains("sin validación").mean() * 100 if "estado_revision" in df.columns else 100.0
     otros = df["tema_principal"].eq("Otros temas").mean() * 100
+
+    indic = html.Div([
+        indicador(f"{len(df)}", "comentarios en la selección", "según los filtros de arriba", 100, NEON["cian"]),
+        indicador(pct(sin_validar), "sin revisión humana", "las etiquetas las puso un programa", sin_validar, NEON["naranja"]),
+        indicador(f"{n_preg}", "son preguntas", f"{pct(n_preg / len(df) * 100)} de la selección", n_preg / len(df) * 100, NEON["amarillo"]),
+        indicador(pct(otros), "en “Otros temas”", "no encajaron en ningún tema", otros, NEON["violeta"]),
+    ], style=FILA)
+
+    paso1 = bloque(1, "¿Qué dicen exactamente los comentarios?",
+                   (f"Estás viendo {len(df)} comentarios: {int(vc.get('Negativo', 0))} negativos, "
+                    f"{int(vc.get('Positivo', 0))} positivos y {int(vc.get('Neutral', 0))} neutrales."),
+                   html.P([html.Strong("Filtros activos: "), filtros_activos or "ninguno (se ven todos los comentarios)"],
+                          style={**S_NOTA, "margin": "0 0 10px"}),
+                   tabla, acento=NEON["cian"],
+                   como=("Los negativos y positivos aparecen primero. Haz clic en el título de una columna para ordenarla y usa las flechas "
+                         "de abajo para cambiar de página. Para ver otros comentarios, usa el panel de control de arriba: además de video, "
+                         "sentimiento y tema, puedes buscar una palabra y quedarte solo con las preguntas."))
+
     limites = [
-        "Las etiquetas de sentimiento y tema son propuestas asistidas, sin validación humana definitiva.",
-        "Son reacciones a tres videos, no la experiencia real de jugar GTA VI.",
-        "La muestra no representa a toda la comunidad; no se pueden sacar conclusiones causales.",
-        "Un comentario puede tener más de un tema o postura; las reglas de palabras clave simplifican.",
+        "Las etiquetas de sentimiento y de tema las puso un programa con reglas simples; ninguna persona las revisó.",
+        "Son reacciones a tres videos, no la experiencia de jugar GTA VI.",
+        "Es una muestra de comentarios: no representa a toda la comunidad ni demuestra causas.",
+        "Un comentario puede hablar de varios temas, pero aquí se le asigna solo uno.",
     ]
+    confianza = tarjeta(
+        "¿Cuánto se puede confiar en estos datos?",
+        html.Ul([html.Li(t) for t in limites], className="lista-neon",
+                style=dict(margin=0, paddingLeft="20px", lineHeight="1.7", fontSize="15px")),
+        acento=NEON["rosa"], etiqueta="PREGUNTA 2")
     revisar = tarjeta(
-        "Una etiqueta que merece revisión humana",
+        "Un ejemplo de etiqueta dudosa",
         cita(df_global, ID_REVISAR, "Etiquetado Positivo", NEON["naranja"]),
-        html.P("El texto pide no ilusionarse con los gráficos, pero la etiqueta asistida lo marcó Positivo. "
-               "Es un ejemplo de por qué el sentimiento es una señal preliminar.", style=S_NOTA),
-        acento=NEON["naranja"], etiqueta="CONTRAEVIDENCIA",
-    )
+        html.P("Este comentario pide no ilusionarse con los gráficos, pero el programa lo marcó como positivo. "
+               "Por eso el sentimiento es una pista inicial, no un resultado definitivo.", style=S_NOTA),
+        acento=NEON["naranja"], etiqueta="CONTRAEJEMPLO")
+
     return html.Div([
-        html.Div([
-            indicador(f"{len(df)}", "comentarios en la selección", "según los filtros activos", 100, NEON["cian"]),
-            indicador(pct(sin_validar), "sin validación humana", "estado de revisión del dataset", sin_validar, NEON["naranja"]),
-            indicador(f"{n_mixtos}", "señales mixtas", "heurística de palabras; puede subestimar", None, NEON["violeta"]),
-            indicador(pct(otros), "en “Otros temas”", f"{n_preg} comentarios son preguntas", otros, NEON["amarillo"]),
-        ], style=FILA),
-        tarjeta("Comentarios seleccionados: úsalos para comprobar cada lectura", tabla,
-                nota="Filtra u ordena la tabla para ubicar los comentarios que respaldan cada lectura.",
-                acento=NEON["cian"], etiqueta="SALA DE EVIDENCIA"),
-        html.Div([
-            html.Div(tarjeta("Alcance y limitaciones",
-                             html.Ul([html.Li(t) for t in limites], className="lista-neon",
-                                     style=dict(margin=0, paddingLeft="20px", lineHeight="1.6")),
-                             acento=NEON["rosa"], etiqueta="LÍMITES"), style=dict(flex="1 1 420px")),
-            html.Div(revisar, style=dict(flex="1 1 420px")),
-        ], style={**FILA, "marginTop": "16px"}),
-    ])
+        indic, paso1,
+        html.Div([html.Div(confianza, style=dict(flex="1 1 380px", minWidth="0")),
+                  html.Div(revisar, style=dict(flex="1 1 380px", minWidth="0"))], style=FILA),
+    ], style=COLUMNA)
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +660,7 @@ html,body{background:#0B0A22;margin:0}
 .Select-arrow{border-top-color:#FF3C8E!important}
 .tarjeta{transition:transform .2s ease}
 .tarjeta:hover{transform:translateY(-2px)}
+.tarjeta:has(.js-plotly-plot):hover{transform:none}
 .estrella{color:#FFD23C;text-shadow:0 0 10px #FFD23C99;animation:pulso 2.4s ease-in-out infinite}
 @keyframes pulso{50%{opacity:.65}}
 .lista-neon li::marker{color:#FF9A3C}
@@ -624,11 +703,14 @@ def _chip(texto: str, color: str = "white") -> html.Span:
     return html.Span(texto, className="chip", style=dict(color=color))
 
 
+S_ETIQUETA_FILTRO = dict(fontWeight=600, fontSize="14px", color=NEON["cian"], textTransform="uppercase", letterSpacing="1px",
+                         display="block", marginBottom="4px")
+
+
 def _filtro(id_: str, etiqueta: str, columna: str, opciones: list) -> html.Div:
     """Lista desplegable múltiple; vacía significa 'todos'."""
     return html.Div([
-        html.Label(etiqueta, htmlFor=id_, style=dict(fontWeight=600, fontSize="14px", color=NEON["cian"],
-                                                      textTransform="uppercase", letterSpacing="1px")),
+        html.Label(etiqueta, htmlFor=id_, style=S_ETIQUETA_FILTRO),
         dcc.Dropdown(id=id_, options=opciones, multi=True, placeholder="Todos"),
     ], style=dict(flex="1 1 220px"))
 
@@ -641,9 +723,12 @@ def crear_app(df: pd.DataFrame) -> Dash:
         "<style>" + CSS + "</style></head><body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body></html>"
     )
 
-    opciones_video = sorted(df["video"].unique())
-    opciones_sent = sorted(df["sentimiento"].unique())
-    opciones_tema = sorted(df["tema_principal"].unique())
+    def opciones(columna: str) -> list[dict]:
+        """Opciones del desplegable con la cantidad de comentarios de cada una: 'Video 1 (263)'."""
+        conteo = df[columna].value_counts()
+        return [{"label": f"{v} ({int(conteo[v])})", "value": v} for v in sorted(conteo.index)]
+
+    opciones_video, opciones_sent, opciones_tema = opciones("video"), opciones("sentimiento"), opciones("tema_principal")
 
     app.layout = html.Div([
         html.Header([
@@ -671,7 +756,31 @@ def crear_app(df: pd.DataFrame) -> Dash:
                 html.Div([_filtro("f-video", "Video", "video", opciones_video),
                           _filtro("f-sent", "Sentimiento", "sentimiento", opciones_sent),
                           _filtro("f-tema", "Tema principal", "tema_principal", opciones_tema)], style={**FILA, "marginBottom": "4px"}),
-                html.P("Los filtros aplican a las vistas 2 y 3.", style={**S_NOTA, "fontSize": "13px", "margin": 0}),
+                html.Div([
+                    html.Div([
+                        html.Label("Buscar en los comentarios", htmlFor="f-texto", style=S_ETIQUETA_FILTRO),
+                        dcc.Input(id="f-texto", type="text", debounce=True, value="", autoComplete="off",
+                                  placeholder="Escribe una palabra (fps, PC, precio…) y presiona Enter",
+                                  style=dict(width="100%", boxSizing="border-box", padding="9px 12px", background="#0F0D33",
+                                             color=TINTA, border=f"1px solid {BORDE}", borderRadius="6px",
+                                             fontFamily=F_TEXTO, fontSize="15px")),
+                    ], style=dict(flex="2 1 320px")),
+                    html.Div([
+                        html.Label("Tipo de comentario", style=S_ETIQUETA_FILTRO),
+                        dcc.RadioItems(id="f-preg", value="todos",
+                                       options=[{"label": "Todos", "value": "todos"},
+                                                {"label": "Solo preguntas", "value": "si"},
+                                                {"label": "Sin preguntas", "value": "no"}],
+                                       labelStyle=dict(display="inline-block", marginRight="16px", fontSize="15px"),
+                                       inputStyle=dict(marginRight="6px")),
+                    ], style=dict(flex="1 1 280px")),
+                    html.Div(html.Button("Limpiar filtros", id="btn-limpiar", n_clicks=0,
+                                         style=dict(padding="9px 16px", background="transparent", color=TINTA,
+                                                    border=f"1px solid {ACENTO}", borderRadius="6px", cursor="pointer",
+                                                    fontFamily=F_TEXTO, fontSize="15px", fontWeight=600)),
+                             style=dict(flex="0 0 auto")),
+                ], id="filtros-v3", style={**FILA, "marginBottom": "4px", "alignItems": "flex-end", "display": "none"}),
+                html.P(id="nota-filtros", style={**S_NOTA, "fontSize": "13px", "margin": 0}),
             ], style={**S_TARJETA, "marginBottom": "18px"}),
             dcc.Tabs(id="tabs", value="v1", colors=dict(border=BORDE, primary=ACENTO, background=PANEL), children=[
                 dcc.Tab(label="Vista 1 · Resumen ejecutivo", value="v1", style=S_PESTANA, selected_style=S_PESTANA_SEL),
@@ -687,16 +796,50 @@ def crear_app(df: pd.DataFrame) -> Dash:
     ], style=dict(background=FONDO, fontFamily=F_TEXTO, color=TINTA, minHeight="100vh"))
 
     @app.callback(
+        Output("filtros-v3", "style"), Output("nota-filtros", "children"),
+        Input("tabs", "value"),
+    )
+    def mostrar_filtros_v3(vista: str):
+        """La búsqueda y el tipo de comentario solo aparecen (y solo aplican) en la vista 3."""
+        estilo = {**FILA, "marginBottom": "4px", "alignItems": "flex-end", "display": "flex" if vista == "v3" else "none"}
+        if vista == "v3":
+            nota = "Video, sentimiento y tema filtran las vistas 2 y 3. La búsqueda y el tipo de comentario filtran solo esta vista."
+        else:
+            nota = "Los filtros de video, sentimiento y tema aplican a las vistas 2 y 3."
+        return estilo, nota
+
+    @app.callback(
+        Output("f-video", "value"), Output("f-sent", "value"), Output("f-tema", "value"),
+        Output("f-texto", "value"), Output("f-preg", "value"),
+        Input("btn-limpiar", "n_clicks"), prevent_initial_call=True,
+    )
+    def limpiar(_clics):
+        return [], [], [], "", "todos"
+
+    @app.callback(
         Output("contenido", "children"),
         Input("tabs", "value"), Input("f-video", "value"), Input("f-sent", "value"), Input("f-tema", "value"),
+        Input("f-texto", "value"), Input("f-preg", "value"),
     )
-    def render(vista: str, videos, sentimientos, temas):
+    def render(vista: str, videos, sentimientos, temas, texto, preguntas):
         if vista == "v1":
             return vista_resumen(df)
         dff = filtrar(df, video=videos, sentimiento=sentimientos, tema_principal=temas)
+        if vista == "v3":
+            dff = filtrar_v3(dff, texto, preguntas)
         if dff.empty:
-            return tarjeta("Ningún comentario cumple los filtros", html.P("Quita algún filtro para ver resultados.", style=S_NOTA))
-        return vista_temas(dff) if vista == "v2" else vista_evidencia(dff, df)
+            return tarjeta("Ningún comentario cumple los filtros",
+                           html.P("Quita algún filtro, revisa la palabra buscada o pulsa “Limpiar filtros”.", style=S_NOTA))
+        if vista == "v3":
+            return vista_evidencia(dff, df, resumen_filtros(videos, sentimientos, temas, texto, preguntas))
+        contenido = vista_temas(dff)
+        if vista == "v2" and sentimientos:
+            aviso = html.P(
+                "⚠ Hay un filtro de sentimiento activo: los porcentajes de sentimiento (temas, videos y tabla) "
+                "se calculan solo sobre esa selección y no representan la conversación completa.",
+                style={**S_NOTA, "color": NEON["naranja"], "margin": "0 0 12px"})
+            return html.Div([aviso, contenido])
+        return contenido
 
     return app
 
